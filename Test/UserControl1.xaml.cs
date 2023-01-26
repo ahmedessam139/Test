@@ -35,7 +35,7 @@ namespace Test
         public WorkflowDesigner WorkflowDesigner;
 
         const String DefultWorkflowFilePath = @"DefaultWorkflows\defaultWorkflow.xaml";
-        public string WorkflowFilePath = @"DefaultWorkflows\defaultWorkflow.xaml";
+        public string WorkflowFilePath = DefultWorkflowFilePath;
         
 
         public UserControl1()
@@ -209,7 +209,7 @@ namespace Test
 
         public void SaveWorkflow()
         {
-            if (WorkflowDesigner != null && (WorkflowFilePath != @"DefaultWorkflows\defaultWorkflow.xaml"))
+            if (WorkflowDesigner != null && (WorkflowFilePath !=DefultWorkflowFilePath))
             {
                 WorkflowDesigner.Flush();
                 WorkflowDesigner.Save(WorkflowFilePath);
@@ -242,7 +242,7 @@ namespace Test
         {
             ClearWorkflow();
 
-            WorkflowFilePath = @"DefaultWorkflows\defaultWorkflow.xaml";
+            WorkflowFilePath =DefultWorkflowFilePath;
 
             AddWorkflowDesigner();
         }

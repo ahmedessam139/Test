@@ -33,11 +33,22 @@ namespace Test
 
 
         public WorkflowDesigner WorkflowDesigner;
+        public IDesignerDebugView DebuggerService;
+
 
         const String DefultWorkflowFilePath = @"DefaultWorkflows\defaultWorkflow.xaml";
         public string WorkflowFilePath = DefultWorkflowFilePath;
+
+        TextBox logsTxtbox;
+
+        Dictionary<int, SourceLocation> textLineToSourceLocationMap;
+        Dictionary<object, SourceLocation> designerSourceLocationMapping = new Dictionary<object, SourceLocation>();
+        Dictionary<object, SourceLocation> wfElementToSourceLocationMap = null;
+
+        AutoResetEvent resumeRuntimeFromHost = null;
+        List<SourceLocation> breakpointList = new List<SourceLocation>();
         
-         
+
         public UserControl1()
         {
             InitializeComponent();
@@ -45,6 +56,7 @@ namespace Test
             this.AddWorkflowDesigner();
             this.AddToolBox();
         }
+        #region Adding Workflow - Toolbox
         private void RegisterMetadata()
         {
             (new DesignerMetadata()).Register();
@@ -52,6 +64,7 @@ namespace Test
         public void AddWorkflowDesigner()
         {
             this.WorkflowDesigner = new WorkflowDesigner();
+            this.DebuggerService = this.WorkflowDesigner.DebugManagerView;
 
 
 
@@ -204,6 +217,7 @@ namespace Test
             xamlTextBox.Text = this.WorkflowDesigner.Text;
 
         }
+        #endregion
         
         #region New-Open-save - Clear
 
@@ -267,13 +281,9 @@ namespace Test
                 try
                 {
                     SaveWorkflow();
-                    var writer = new StringWriter();
                     var workflow = ActivityXamlServices.Load(WorkflowFilePath);
                     var wa = new WorkflowApplication(workflow);
-                    wa.Extensions.Add(writer);
                     wa.Run();
-
-
                 }
                 catch (Exception ex)
                 {
@@ -282,6 +292,118 @@ namespace Test
             }
         }
         #endregion
+
+        #region debuging Runner 
+
+        public void RunWorkflow()
+        {
+
+            WorkflowDesigner.Flush();
+            SaveWorkflow();
+            logsTxtbox.Text = String.Empty;
+            AddWorkflowDesigner();
+            wfElementToSourceLocationMap = UpdateSourceLocationMappingInDebuggerService();
+
+
+            WorkflowInvoker instance = new WorkflowInvoker(GetRuntimeExecutionRoot());
+            resumeRuntimeFromHost = new AutoResetEvent(false);
+
+            Dictionary<string, Activity> activityIdToWfElementMap = BuildActivityIdToWfElementMap(wfElementToSourceLocationMap);
+
+            #region Set up the Custom Tracking
+            const String all = "*";
+            SimulatorTrackingParticipant simTracker = new SimulatorTrackingParticipant()
+            {
+                TrackingProfile = new TrackingProfile()
+                {
+                    Name = "CustomTrackingProfile",
+                    Queries =
+                    {
+                        new CustomTrackingQuery()
+                        {
+                            Name = all,
+                            ActivityName = all
+                        },
+                        new WorkflowInstanceQuery()
+                        {
+                            // Limit workflow instance tracking records for started and completed workflow states
+                            States = { WorkflowInstanceStates.Started, WorkflowInstanceStates.Completed, WorkflowInstanceStates.Idle },
+                        },
+                        new ActivityStateQuery()
+                        {
+                            // Subscribe for track records from all activities for all states
+                            ActivityName = all,
+                            States = { all },
+
+                            // Extract workflow variables and arguments as a part of the activity tracking record
+                            // VariableName = "*" allows for extraction of all variables in the scope
+                            // of the activity
+                            Variables =
+                            {
+                                { all }
+                            }
+                        }
+                    }
+                }
+            };
+
+            simTracker.ActivityIdToWorkflowElementMap = activityIdToWfElementMap;
+
+            #endregion
+
+            //As the tracking events are received
+            simTracker.TrackingRecordReceived += (trackingParticpant, trackingEventArgs) =>
+            {
+                if (trackingEventArgs.Activity != null)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        String.Format("<+=+=+=+> Activity Tracking Record Received for ActivityId: {0}, record: {1} ",
+                        trackingEventArgs.Activity.Id,
+                        trackingEventArgs.Record
+                        )
+                    );
+
+                    ShowDebug(wfElementToSourceLocationMap[trackingEventArgs.Activity]);
+
+                    this.Dispatcher.Invoke(DispatcherPriority.SystemIdle, (Action)(() =>
+                    {
+                        //Textbox Updates
+                        logsTxtbox.AppendText(trackingEventArgs.Activity.Id + " " + trackingEventArgs.Activity.DisplayName + " " + ((ActivityStateRecord)trackingEventArgs.Record).State + "\n");
+                        logsTxtbox.AppendText("Instance ID: " + ((ActivityStateRecord)trackingEventArgs.Record).InstanceId + "\n");
+                        logsTxtbox.AppendText("Activity: " + ((ActivityStateRecord)trackingEventArgs.Record).Activity.Name + "\n");
+                        logsTxtbox.AppendText("Level: " + ((ActivityStateRecord)trackingEventArgs.Record).Level + "\n");
+                        logsTxtbox.AppendText("Time: " + ((ActivityStateRecord)trackingEventArgs.Record).EventTime + "\n");
+                        logsTxtbox.AppendText("************************\n");
+
+
+                        //Add a sleep so that the debug adornments are visible to the user
+                        System.Threading.Thread.Sleep(500);
+                    }));
+                }
+            };
+
+            instance.Extensions.Add(simTracker);
+            ThreadPool.QueueUserWorkItem(new WaitCallback((context) =>
+            {
+                //Start the Runtime
+                instance.Invoke();// new TimeSpan(1,0,0));
+
+                //This is to remove the final debug adornment
+                this.Dispatcher.Invoke(DispatcherPriority.Render
+                    , (Action)(() =>
+                    {
+                        this.WorkflowDesigner.DebugManagerView.CurrentLocation = new SourceLocation(WorkflowFilePath, 1, 1, 1, 10);
+                    }));
+
+            }));
+
+
+        }
+
+
+        #endregion
+
+        #region Helper Methods
 
         public void ClearWorkflow()
         {
@@ -292,6 +414,197 @@ namespace Test
                 WorkflowDesigner = null;
             }
         }
+        void ShowDebug(SourceLocation srcLoc)
+        {
+            this.Dispatcher.Invoke(DispatcherPriority.Render
+                , (Action)(() =>
+                {
+
+                    this.WorkflowDesigner.DebugManagerView.CurrentLocation = srcLoc;
+
+                }));
+
+            //Check if this is where any Breakpoint is set
+            bool isBreakpointHit = false;
+            foreach (SourceLocation src in breakpointList)
+            {
+                if (src.StartLine == srcLoc.StartLine && src.EndLine == srcLoc.EndLine)
+                {
+                    isBreakpointHit = true;
+                }
+            }
+
+            if (isBreakpointHit == true)
+            {
+                resumeRuntimeFromHost.WaitOne();
+            }
+
+        }
+
+
+
+        private Dictionary<string, Activity> BuildActivityIdToWfElementMap(Dictionary<object, SourceLocation> wfElementToSourceLocationMap)
+        {
+            Dictionary<string, Activity> map = new Dictionary<string, Activity>();
+
+            Activity wfElement;
+            foreach (object instance in wfElementToSourceLocationMap.Keys)
+            {
+                wfElement = instance as Activity;
+                if (wfElement != null)
+                {
+                    map.Add(wfElement.Id, wfElement);
+                }
+            }
+
+            return map;
+
+        }
+
+
+        Dictionary<object, SourceLocation> UpdateSourceLocationMappingInDebuggerService()
+        {
+            object rootInstance = GetRootInstance();
+            Dictionary<object, SourceLocation> sourceLocationMapping = new Dictionary<object, SourceLocation>();
+
+
+            if (rootInstance != null)
+            {
+                Activity documentRootElement = GetRootWorkflowElement(rootInstance);
+
+                SourceLocationProvider.CollectMapping(GetRootRuntimeWorkflowElement(), documentRootElement, sourceLocationMapping,
+                    this.WorkflowDesigner.Context.Items.GetValue<WorkflowFileItem>().LoadedFile);
+
+                //Collect the mapping between the Model Item tree and its underlying source location
+                SourceLocationProvider.CollectMapping(documentRootElement, documentRootElement, designerSourceLocationMapping,
+                   this.WorkflowDesigner.Context.Items.GetValue<WorkflowFileItem>().LoadedFile);
+
+            }
+
+            // Notify the DebuggerService of the new sourceLocationMapping.
+            // When rootInstance == null, it'll just reset the mapping.
+            //DebuggerService debuggerService = debuggerService as DebuggerService;
+            if (this.DebuggerService != null)
+            {
+                ((DebuggerService)this.DebuggerService).UpdateSourceLocations(designerSourceLocationMapping);
+            }
+
+            return sourceLocationMapping;
+        }
+
+
+        object GetRootInstance()
+        {
+            ModelService modelService = this.WorkflowDesigner.Context.Services.GetService<ModelService>();
+            if (modelService != null)
+            {
+                return modelService.Root.GetCurrentValue();
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+
+        // Get root WorkflowElement.  Currently only handle when the object is ActivitySchemaType or WorkflowElement.
+        // May return null if it does not know how to get the root activity.
+        Activity GetRootWorkflowElement(object rootModelObject)
+        {
+            System.Diagnostics.Debug.Assert(rootModelObject != null, "Cannot pass null as rootModelObject");
+
+            Activity rootWorkflowElement;
+            IDebuggableWorkflowTree debuggableWorkflowTree = rootModelObject as IDebuggableWorkflowTree;
+            if (debuggableWorkflowTree != null)
+            {
+                rootWorkflowElement = debuggableWorkflowTree.GetWorkflowRoot();
+            }
+            else // Loose xaml case.
+            {
+                rootWorkflowElement = rootModelObject as Activity;
+            }
+            return rootWorkflowElement;
+        }
+
+        Activity GetRuntimeExecutionRoot()
+        {
+
+            Activity root = ActivityXamlServices.Load(WorkflowFilePath);
+            WorkflowInspectionServices.CacheMetadata(root);
+
+            return root;
+        }
+
+
+        Activity GetRootRuntimeWorkflowElement()
+        {
+
+            Activity root = ActivityXamlServices.Load(WorkflowFilePath);
+            WorkflowInspectionServices.CacheMetadata(root);
+
+
+            IEnumerator<Activity> enumerator1 = WorkflowInspectionServices.GetActivities(root).GetEnumerator();
+            //Get the first child of the x:class
+            enumerator1.MoveNext();
+            root = enumerator1.Current;
+            return root;
+        }
+        void AddTrackingTextbox()
+        {
+            Grid.SetRow(logsTxtbox, 1);
+            this.TrackingRecord.Children.Add(logsTxtbox);
+        }
+
+        #endregion
+
+        #region Debugging controls
+
+
+        public void BreakPointToggle()
+        {
+            ModelItem mi = this.WorkflowDesigner.Context.Items.GetValue<Selection>().PrimarySelection;
+            Activity a = mi.GetCurrentValue() as Activity;
+
+            if (a != null)
+            {
+                SourceLocation srcLoc = designerSourceLocationMapping[a];
+                if (!breakpointList.Contains(srcLoc))
+                {
+                    this.WorkflowDesigner.Context.Services.GetService<IDesignerDebugView>().UpdateBreakpoint(srcLoc, BreakpointTypes.Bounded | BreakpointTypes.Enabled);
+                    breakpointList.Add(srcLoc);
+                }
+                else
+                {
+                    this.WorkflowDesigner.Context.Services.GetService<IDesignerDebugView>().UpdateBreakpoint(srcLoc, BreakpointTypes.None);
+                    breakpointList.Remove(srcLoc);
+                }
+            }
+
+
+        }
+
+        public void _continue()
+        {
+            resumeRuntimeFromHost.Set();
+        }
+
+        protected override void OnKeyDown(System.Windows.Input.KeyEventArgs e)
+        {
+
+            if (e.Key == Key.F9)
+            {
+                BreakPointToggle();
+            }
+            else if (e.Key == Key.F5)
+            {
+                _continue();
+            }
+        }
+
+
+
+
+        #endregion
 
     }
 }

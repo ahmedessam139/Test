@@ -41,7 +41,7 @@ namespace Test
 
         private void btnSaveWorkflow_Click(object sender, RoutedEventArgs e)
         {
-
+            UserControl1.SaveWorkflow();
         }
 
         private void btnNewWorkflow_Click(object sender, RoutedEventArgs e)
